@@ -1030,26 +1030,16 @@ def calculated_step_length(left_mean_dict,
 #计算左右腿步宽
 def calculated_gait_width(left_width_mean,
                           right_width_mean,
-                          left_hipz_col,
-                          right_hipz_col,
                           thigh_length=50,
                           shank_length=40,
                           origin_width=20)->Tuple[Dict[str,float],Dict[str,float]]:
     """
     根据髋关节角度计算步宽
     """
-    left_width_value=(
-    origin_width
-    +np.sin(np.deg2rad(left_width_mean.get(f"{left_hipz_col}_right_val",np.nan)))*(thigh_length+shank_length)
-    -np.sin(np.deg2rad(left_width_mean.get(f"{right_hipz_col}_right_val",np.nan)))*(thigh_length+shank_length)
-    )
+    left_width_value=abs((origin_width-np.sin(np.deg2rad(left_width_mean.get("step_width_preprocessed",np.nan)+5))*(thigh_length+shank_length)))
     left_width={"left_width_value":left_width_value}
     #(8.4)计算右步宽
-    right_width_value=(
-        origin_width
-    +np.sin(np.deg2rad(right_width_mean.get(f"{left_hipz_col}_right_val",np.nan)))*(thigh_length+shank_length)
-    -np.sin(np.deg2rad(right_width_mean.get(f"{right_hipz_col}_right_val",np.nan)))*(thigh_length+shank_length)
-    )
+    right_width_value=abs((origin_width-np.sin(np.deg2rad(right_width_mean.get("step_width_preprocessed",np.nan)+5))*(thigh_length+shank_length)))
     right_width={"right_width_value":right_width_value}
     return left_width, right_width
 #计算左右步长
@@ -1122,6 +1112,118 @@ def degree_to_sin(df: pd.DataFrame, columns: list) -> pd.DataFrame:
             sin_col = f"{col}_sin"
             df[sin_col] = np.sin(np.deg2rad(pd.to_numeric(df[col], errors="coerce").astype(float)))
     return df
+
+def preprocess_step_width_signal(
+    triplets_df: pd.DataFrame,
+    df_proc: pd.DataFrame,
+    left_hipz_col: str,
+    right_hipz_col: str,
+    value_mode: Literal["right", "mean", "max", "min", "rms"] = "right",
+    output_col: str = "step_width_preprocessed"
+) -> pd.DataFrame:
+    """
+    基于 triplets_df 的每个配对区间，重新计算步宽相关预处理量。
+
+    对每个区间 [left, right]：
+      1) 计算 diff = df_proc[right_hipz_col] - df_proc[left_hipz_col]
+      2) 在该区间内，对 diff 减去该区间 diff 的均值
+      3) 根据 value_mode 从该区间提取一个代表值，写入 triplets_df 新列
+
+    参数
+    ----------
+    triplets_df : pd.DataFrame
+        必须至少包含列 ["left", "right"]，一般也会有 "signal" 等其它列
+    df_proc : pd.DataFrame
+        预处理后的时序数据
+    left_hipz_col : str
+        左髋 z 方向对应列名
+    right_hipz_col : str
+        右髋 z 方向对应列名
+    thigh_length : float
+        大腿长度（当前函数中先保留接口，未参与计算）
+    shank_length : float
+        小腿长度（当前函数中先保留接口，未参与计算）
+    origin_width : float
+        初始宽度（当前函数中先保留接口，未参与计算）
+    value_mode : {"right","mean","max","min","rms"}
+        从区间去均值后信号中提取哪个值作为该配对区间的最终输出
+        - "right": 取区间末端（right索引）对应值
+        - "mean": 取区间均值（理论上会接近0）
+        - "max": 取区间最大值
+        - "min": 取区间最小值
+        - "rms": 取区间均方根
+    output_col : str
+        输出列列名
+
+    返回
+    ----------
+    out_df : pd.DataFrame
+        在 triplets_df 基础上新增一列 output_col
+    """
+    # ---- 输入检查 ----
+    required_cols = {"left", "right"}
+    missing = required_cols - set(triplets_df.columns)
+    if missing:
+        raise ValueError(f"triplets_df 缺少必要列: {sorted(missing)}")
+
+    for c in [left_hipz_col, right_hipz_col]:
+        if c not in df_proc.columns:
+            raise ValueError(f"列 '{c}' 不在 df_proc 中")
+
+    if value_mode not in {"right", "mean", "max", "min", "rms"}:
+        raise ValueError("value_mode 必须是 'right', 'mean', 'max', 'min', 'rms' 之一")
+
+    out_df = triplets_df.copy().reset_index(drop=True)
+    n_samples = len(df_proc)
+
+    # 整体先算出左右差值信号
+    hip_diff_all = (
+        pd.to_numeric(df_proc[right_hipz_col], errors="coerce").to_numpy(dtype=float)
+        - pd.to_numeric(df_proc[left_hipz_col], errors="coerce").to_numpy(dtype=float)
+    )
+
+    processed_vals = []
+
+    for _, row in out_df.iterrows():
+        iL = int(row["left"])
+        iR = int(row["right"])
+
+        # 合法性检查
+        if not (0 <= iL < n_samples and 0 <= iR < n_samples and iL < iR):
+            processed_vals.append(np.nan)
+            continue
+
+        seg = hip_diff_all[iL:iR+1]
+
+        # 去掉 NaN 后判断
+        if np.all(~np.isfinite(seg)):
+            processed_vals.append(np.nan)
+            continue
+
+        # 区间均值（忽略 NaN）
+        seg_mean = np.nanmean(seg)
+
+        # 区间内去均值
+        seg_centered = seg - seg_mean
+
+        # 按模式取代表值
+        if value_mode == "right":
+            val = seg_centered[-1]
+        elif value_mode == "mean":
+            val = np.nanmean(seg_centered)
+        elif value_mode == "max":
+            val = np.nanmax(seg_centered)
+        elif value_mode == "min":
+            val = np.nanmin(seg_centered)
+        elif value_mode == "rms":
+            val = np.sqrt(np.nanmean(seg_centered ** 2))
+        else:
+            val = np.nan
+
+        processed_vals.append(float(val) if np.isfinite(val) else np.nan)
+
+    out_df[output_col] = processed_vals
+    return out_df
 
 #根据main的调试情况，将所有步态参数计算的过程改成一个函数
 def calculate_gait_parameters(df_raw: pd.DataFrame,
@@ -1335,39 +1437,46 @@ def calculate_gait_parameters(df_raw: pd.DataFrame,
 
         kneez_col=["imu3ang_z","imu6ang_z"]
         #(8)计算用于步宽计算的角度信息
-        width_angle_vals, right_vals = extract_right_values_from_triplets(
-            df_proc=df_proc,
+               #(8)计算用于步宽计算的角度信息
+        width_df=preprocess_step_width_signal(
             triplets_df=triplets_df,
-            columns=[left_hipz_col, right_hipz_col]+kneez_col
+            df_proc=df_proc,
+            left_hipz_col=left_hipz_col,
+            right_hipz_col=right_hipz_col,
+            value_mode="right",
+            output_col="step_width_preprocessed"
         )
-        hipz_col=[left_hipz_col, right_hipz_col]
-
         #(8.1)对左侧腿筛选，统一计算中位筛选均值
         left_width_mean=compute_midmean_from_signals(
-            out_df=width_angle_vals,
+            out_df=width_df,
             signals=left_cols,
-            columns=[f"{col}_right_val" for col in hipz_col],
-            mid_num=1
+            columns=["step_width_preprocessed"],
+            mid_num=3
         )
+        print("左侧腿步宽:")
+        print(left_width_mean)
         #(8.2)对左侧腿筛选，统一计算中位筛选均值
         right_width_mean=compute_midmean_from_signals(
-            out_df=width_angle_vals,
+            out_df=width_df,
             signals=right_cols,
-            columns=[f"{col}_right_val" for col in hipz_col],
-            mid_num=1
+            columns=["step_width_preprocessed"],
+            mid_num=3
         )
         #(8.3)计算左步宽
+        left_width_mean=compute_midmean_from_signals(
+            out_df=width_df,
+            signals=left_cols,
+            columns=["step_width_preprocessed"],
+            mid_num=3
+        )
         left_width,right_width=calculated_gait_width(
             left_width_mean=left_width_mean,
             right_width_mean=right_width_mean,
-            left_hipz_col=left_hipz_col,
-            right_hipz_col=right_hipz_col,
             thigh_length=thigh_length,
             shank_length=shank_length,
             origin_width=origin_width)
 
         step_width={"step_width":0.5*(left_width.get("left_width_value",np.nan)+right_width.get("right_width_value",np.nan))}
-        #(8.4)计算右步宽
         #(9)计算用于步长计算的角度信息
         length_angle_vals, right_vals = extract_right_values_from_triplets(
             df_proc=df_proc,
@@ -1487,12 +1596,12 @@ def calculate_gait_parameters(df_raw: pd.DataFrame,
         return gait_params
 
 if __name__ == "__main__":
-    #df_raw=pd.read_csv("E:/demo/python/Gait1016/datasets/ZJH/gait01_results/gait01_pre00.csv",encoding='utf-8-sig')
-    df_raw=pd.read_csv("E:/demo/python/Gait1016/datasets/rawZJH/gait09_results/gait09_pre00.csv",encoding='utf-8-sig')
+   df_raw=pd.read_csv("E:/demo/python/Gait1016/datasets/ZJH/gait01_results/gait01_pre00.csv",encoding='utf-8-sig')
+    #df_raw=pd.read_csv("E:/demo/python/Gait1016/datasets/data_20260307_215452_pre00.csv",encoding='utf-8-sig')
     #(1)配置预处理参数
-    # thigh_length=55
-    # shank_length=44
-    # origin_width=30
+    thigh_length=44
+    shank_length=40
+    origin_width=20
     cfg = PreprocessConfig(
         fs=50.0,                 # 你的原始采样率
         time_col="时间",           # 若CSV没有时间列就用None；有的话写列名，如 "time"
@@ -1500,7 +1609,7 @@ if __name__ == "__main__":
         baseline_frames=20,      # 去基线
         interpolate_nan=True,    # 插值
         resample_hz=None,        # 是否统一重采样，通常保持None
-        unwrap_angle=False,      # 角度是否去包裹
+        unwrap_angle=True,      # 角度是否去包裹
         use_angle_sincos=False,  # 是否展开角度为sin/cos（做分类/回归时常用）
         # 滤波：角度/陀螺/加速度分组不同cut-off
         ang_low_hz=6.0,
@@ -1722,28 +1831,37 @@ if __name__ == "__main__":
 
         kneez_col=["imu3ang_z","imu6ang_z"]
         #(8)计算用于步宽计算的角度信息
-        width_angle_vals, right_vals = extract_right_values_from_triplets(
-            df_proc=df_proc,
+        width_df=preprocess_step_width_signal(
             triplets_df=triplets_df,
-            columns=[left_hipz_col, right_hipz_col]+kneez_col
+            df_proc=df_proc,
+            left_hipz_col=left_hipz_col,
+            right_hipz_col=right_hipz_col,
+            value_mode="right",
+            output_col="step_width_preprocessed"
         )
-        hipz_col=[left_hipz_col, right_hipz_col]
-
         #(8.1)对左侧腿筛选，统一计算中位筛选均值
         left_width_mean=compute_midmean_from_signals(
-            out_df=width_angle_vals,
+            out_df=width_df,
             signals=left_cols,
-            columns=[f"{col}_right_val" for col in hipz_col],
-            mid_num=1
+            columns=["step_width_preprocessed"],
+            mid_num=3
         )
+        print("左侧腿步宽:")
+        print(left_width_mean)
         #(8.2)对左侧腿筛选，统一计算中位筛选均值
         right_width_mean=compute_midmean_from_signals(
-            out_df=width_angle_vals,
+            out_df=width_df,
             signals=right_cols,
-            columns=[f"{col}_right_val" for col in hipz_col],
-            mid_num=1
+            columns=["step_width_preprocessed"],
+            mid_num=3
         )
         #(8.3)计算左步宽
+        left_width_mean=compute_midmean_from_signals(
+            out_df=width_df,
+            signals=left_cols,
+            columns=["step_width_preprocessed"],
+            mid_num=3
+        )
         left_width,right_width=calculated_gait_width(
             left_width_mean=left_width_mean,
             right_width_mean=right_width_mean,
